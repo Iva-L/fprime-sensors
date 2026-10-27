@@ -29,14 +29,18 @@ void BmpManager ::parameterUpdated(FwPrmIdType id) {
             const PressureOversampling oversampling = this->paramGet_PRESSURE_OVERSAMPLING(isValid);
             FW_ASSERT(FW_PARAM_OK(isValid), static_cast<FwAssertArgType>(isValid));
             this->log_ACTIVITY_HI_PressureOversamplingUpdated(oversampling);
-            this->m_state = CONFIGURE;
+            if (this->m_state == RUNNING) {
+                this->m_state = CONFIGURE;
+            }
             break;
         }
         case PARAMID_TEMPERATURE_OVERSAMPLING: {
             const TemperatureOversampling oversampling = this->paramGet_TEMPERATURE_OVERSAMPLING(isValid);
             FW_ASSERT(FW_PARAM_OK(isValid), static_cast<FwAssertArgType>(isValid));
             this->log_ACTIVITY_HI_TemperatureOversamplingUpdated(oversampling);
-            this->m_state = CONFIGURE;
+            if (this->m_state == RUNNING) {
+                this->m_state = CONFIGURE;
+            }
             break;
         }
         case PARAMID_SEA_LEVEL_PRESSURE:
