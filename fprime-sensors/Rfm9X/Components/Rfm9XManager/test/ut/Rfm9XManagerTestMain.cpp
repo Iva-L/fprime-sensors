@@ -4,19 +4,14 @@
 
 #include "Rfm9XManagerTester.hpp"
 
-TEST(Nominal, CommandSignalGate) {
+TEST(OffNominal, StatusReadRequired) {
     Rfm9X::Rfm9XManagerTester tester;
-    tester.test_command_signal_gate();
+    tester.test_status_read_required();
 }
 
 TEST(Nominal, ComSignalGate) {
     Rfm9X::Rfm9XManagerTester tester;
     tester.test_com_signal_gate();
-}
-
-TEST(OffNominal, StatusReadRequired) {
-    Rfm9X::Rfm9XManagerTester tester;
-    tester.test_status_read_required();
 }
 
 TEST(Nominal, Initialization) {
@@ -197,31 +192,6 @@ TEST(OffNominal, ResetDuringTransmit) {
 TEST(Nominal, LocalHoldOrdering) {
     Rfm9X::Rfm9XManagerTester tester(true);
     tester.test_local_hold_ordering();
-}
-
-TEST(Nominal, SendStringCommand) {
-    Rfm9X::Rfm9XManagerTester tester;
-    tester.test_send_string_command();
-}
-
-TEST(OffNominal, SendStringZeroSize) {
-    Rfm9X::Rfm9XManagerTester tester;
-    tester.test_send_string_zero_size();
-}
-
-TEST(OffNominal, SendStringNotReady) {
-    Rfm9X::Rfm9XManagerTester tester;
-    tester.test_send_string_not_ready();
-}
-
-TEST(OffNominal, SendStringBusy) {
-    Rfm9X::Rfm9XManagerTester tester;
-    tester.test_send_string_busy();
-}
-
-TEST(Nominal, SendStringNoComSideEffects) {
-    Rfm9X::Rfm9XManagerTester tester;
-    tester.test_send_string_no_com_side_effects();
 }
 
 TEST(Nominal, SingleSpiRequestInFlight) {

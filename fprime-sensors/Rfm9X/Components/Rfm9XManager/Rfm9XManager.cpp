@@ -43,8 +43,6 @@ Rfm9XManager ::Rfm9XManager(const char* const compName)
       m_txBuffer(),
       m_txContext(),
       m_txWaitTicks(0),
-      m_txOrigin(TX_ORIGIN_COM),
-      m_cmdPayload{},
       m_pendingTxBuffers{},
       m_pendingTxContexts{},
       m_pendingTxCount(0),
@@ -200,7 +198,7 @@ void Rfm9XManager ::dataIn_handler(FwIndexType portNum, Fw::Buffer& data, const 
             // Keep FIFO order: a new frame must not jump ahead of held frames.
             held = this->enqueuePendingTransmit(data, context);
         } else {
-            accepted = this->startTransmit(data, context, TX_ORIGIN_COM);
+            accepted = this->startTransmit(data, context);
             if (accepted) {
                 this->m_comResumeNeeded = false;
             } else {
@@ -296,7 +294,6 @@ void Rfm9XManager ::spiWriteReadComplete_handler(FwIndexType portNum, Fw::Buffer
     Fw::Buffer completedBuffer;
     ComCfg::FrameContext completedContext;
     bool txCompleted = false;
-    bool txCompletedIsCom = false;
     Fw::Buffer dropBuffer;
     ComCfg::FrameContext dropContext;
     bool dropPending = false;
@@ -319,7 +316,6 @@ void Rfm9XManager ::spiWriteReadComplete_handler(FwIndexType portNum, Fw::Buffer
                 txProgress = this->continueAdvanceTransmit(status);
                 if (txProgress != TX_IN_PROGRESS) {
                     txCompleted = true;
-                    txCompletedIsCom = (this->m_txOrigin == TX_ORIGIN_COM);
                     completedBuffer = this->m_txBuffer;
                     completedContext = this->m_txContext;
                     this->m_txBuffer = Fw::Buffer();
@@ -333,13 +329,7 @@ void Rfm9XManager ::spiWriteReadComplete_handler(FwIndexType portNum, Fw::Buffer
                         // not the Com protocol.
                         this->m_txTxHoldoffTicks = this->m_txTxHoldoffBoundTicks;
                     }
-                    // m_comResumeNeeded tracks an outstanding Com FAILURE/SUCCESS
-                    // obligation; a command-originated buffer was never reported to
-                    // Com in the first place (no dataReturnOut/comStatusOut below),
-                    // so it must not perturb that bookkeeping either way.
-                    if (txCompletedIsCom) {
-                        this->m_comResumeNeeded = (txProgress != TX_SUCCEEDED);
-                    }
+                    this->m_comResumeNeeded = (txProgress != TX_SUCCEEDED);
                 }
                 break;
             case SPI_OP_RX:
@@ -365,7 +355,7 @@ void Rfm9XManager ::spiWriteReadComplete_handler(FwIndexType portNum, Fw::Buffer
     if (rxPacketSize > 0) {
         this->deliverReceivedPacket(rxPacket, rxPacketSize);
     }
-    if (txCompleted && txCompletedIsCom) {
+    if (txCompleted) {
         this->dataReturnOut_out(0, completedBuffer, completedContext);
         this->emitComStatus(txProgress == TX_SUCCEEDED ? Fw::Success::SUCCESS : Fw::Success::FAILURE);
     }
@@ -644,7 +634,7 @@ void Rfm9XManager ::reportRadioState() {
     this->m_pendingOutputs.radioState = state;
 }
 
-bool Rfm9XManager ::startTransmit(Fw::Buffer& data, const ComCfg::FrameContext& context, TxOrigin origin) {
+bool Rfm9XManager ::startTransmit(Fw::Buffer& data, const ComCfg::FrameContext& context) {
     // One Com buffer → one RF packet (1..255). No radio-layer split/reassembly.
     const FwSizeType size = data.getSize();
     if ((data.getData() == nullptr) || (size == 0) || (size > MAX_PACKET_PAYLOAD)) {
@@ -654,7 +644,6 @@ bool Rfm9XManager ::startTransmit(Fw::Buffer& data, const ComCfg::FrameContext& 
     }
     this->m_txBuffer = data;
     this->m_txContext = context;
-    this->m_txOrigin = origin;
     this->m_txWaitTicks = 0;
     this->m_txState = TX_REQUEST_STANDBY;
     this->m_txActive = true;
@@ -699,7 +688,7 @@ bool Rfm9XManager ::tryStartPendingTransmit(Fw::Buffer& dropBuffer, ComCfg::Fram
         this->m_pendingTxContexts[i - 1] = this->m_pendingTxContexts[i];
     }
     this->m_pendingTxCount--;
-    if (this->startTransmit(data, context, TX_ORIGIN_COM)) {
+    if (this->startTransmit(data, context)) {
         return false;
     }
     // Permanent reject (empty/oversized): caller returns ownership after unlock.
@@ -738,7 +727,6 @@ void Rfm9XManager ::RESET_cmdHandler(FwOpcodeType opCode, U32 cmdSeq) {
     Fw::Buffer abortBuffer;
     ComCfg::FrameContext abortContext;
     bool abortPending = false;
-    bool abortIsCom = false;
     {
         Os::ScopeLock lock(this->m_lock);
         // Fail an in-flight TX immediately: the radio is about to be held in
@@ -748,56 +736,24 @@ void Rfm9XManager ::RESET_cmdHandler(FwOpcodeType opCode, U32 cmdSeq) {
         // dropped as stale (see spiWriteReadComplete_handler()).
         abortPending = this->m_txActive;
         if (abortPending) {
-            abortIsCom = (this->m_txOrigin == TX_ORIGIN_COM);
             abortBuffer = this->m_txBuffer;
             abortContext = this->m_txContext;
             this->m_txBuffer = Fw::Buffer();
             this->m_txState = TX_IDLE;
             this->m_txActive = false;
-            if (abortIsCom) {
-                this->m_comResumeNeeded = true;
-            }
+            this->m_comResumeNeeded = true;
         }
         // Tick-driven: the optional RST pulse and re-detect are advanced one
         // bounded step per run() tick, so no command-context blocking occurs.
         this->beginResetSequence();
     }
     this->flushPendingOutputs();  // beginResetSequence() -> reportRadioState() stages tlmWrite_RadioState
-    if (abortPending && abortIsCom) {
+    if (abortPending) {
         this->dataReturnOut_out(0, abortBuffer, abortContext);
         this->emitComStatus(Fw::Success::FAILURE);
     }
     this->log_ACTIVITY_HI_ResetInitiated();
     this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::OK);
-}
-
-void Rfm9XManager ::SEND_STRING_cmdHandler(FwOpcodeType opCode, U32 cmdSeq, const Fw::CmdStringArg& payload) {
-    const FwSizeType size = payload.length();
-    bool accepted = false;
-    Rfm9XSendFailure failureReason = Rfm9XSendFailure::NOT_READY;
-    {
-        Os::ScopeLock lock(this->m_lock);
-        if ((size == 0) || (size > MAX_PACKET_PAYLOAD)) {
-            failureReason = Rfm9XSendFailure::INVALID_SIZE;
-        } else if ((this->m_state != READY) || this->m_txActive ||
-                   (this->m_transmitEnabled != TransmitState::ENABLED) || this->downlinkBlocked()) {
-            // downlinkBlocked() already covers channelBusy()/holdoff checks.
-            failureReason = Rfm9XSendFailure::NOT_READY;
-        } else {
-            (void)::memcpy(this->m_cmdPayload, payload.toChar(), size);
-            Fw::Buffer buffer(this->m_cmdPayload, size);
-            ComCfg::FrameContext cmdContext;
-            accepted = this->startTransmit(buffer, cmdContext, TX_ORIGIN_COMMAND);
-        }
-    }
-    this->flushPendingOutputs();
-    if (accepted) {
-        this->log_ACTIVITY_HI_TestPayloadQueued(size);
-        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::OK);
-    } else {
-        this->log_WARNING_HI_SendFailed(failureReason);
-        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::EXECUTION_ERROR);
-    }
 }
 
 // ----------------------------------------------------------------------

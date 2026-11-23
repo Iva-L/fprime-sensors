@@ -40,8 +40,8 @@ module Rfm9X {
         @ Maximum LoRa packet payload, in bytes. The SX127x's RegPayloadLength/
         @ RX_NB_BYTES registers are one byte wide, so this can never exceed
         @ 255 regardless of the override. Sizes every fixed payload/scratch
-        @ buffer in Rfm9XManager and Rfm9XSim (m_mosi/m_miso/m_rxPayload/
-        @ m_cmdPayload each scale with this) -- a project that only ever
+        @ buffer in Rfm9XManager and Rfm9XSim (including SPI and receive
+        @ buffers) -- a project that only ever
         @ sends short packets can shrink this to cut RAM; 255 keeps full
         @ single-packet headroom.
         constant MAX_PAYLOAD_LENGTH = 255
