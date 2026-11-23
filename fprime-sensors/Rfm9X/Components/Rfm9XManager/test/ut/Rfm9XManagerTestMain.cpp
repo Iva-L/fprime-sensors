@@ -4,6 +4,21 @@
 
 #include "Rfm9XManagerTester.hpp"
 
+TEST(Nominal, CommandSignalGate) {
+    Rfm9X::Rfm9XManagerTester tester;
+    tester.test_command_signal_gate();
+}
+
+TEST(Nominal, ComSignalGate) {
+    Rfm9X::Rfm9XManagerTester tester;
+    tester.test_com_signal_gate();
+}
+
+TEST(OffNominal, StatusReadRequired) {
+    Rfm9X::Rfm9XManagerTester tester;
+    tester.test_status_read_required();
+}
+
 TEST(Nominal, Initialization) {
     Rfm9X::Rfm9XManagerTester tester;
     tester.test_initialization();

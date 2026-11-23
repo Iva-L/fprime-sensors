@@ -74,10 +74,7 @@ void Rfm9XManager ::issueRequestMode(U8 mode, SpiOpOrigin origin) {
 }
 
 bool Rfm9XManager ::channelBusy() {
-    // LoRa has no SyncAddressMatch-equivalent IRQ bit; RegModemStat reports
-    // live demodulator activity (datasheet section 6.4, RegModemStat 0x18).
-    // Pure accessor now that SPI is async: the RX sequence's RX_CHECK_BUSY
-    // step refreshes m_lastChannelBusy once per idle poll cycle.
+    // The RX sequence refreshes the cached signal-detected bit once per poll.
     return this->m_lastChannelBusy;
 }
 

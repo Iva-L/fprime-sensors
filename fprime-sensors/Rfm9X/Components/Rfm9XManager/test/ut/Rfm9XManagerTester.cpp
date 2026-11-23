@@ -17,6 +17,8 @@ Rfm9XManagerTester ::Rfm9XManagerTester(bool localHold)
       component("Rfm9XManager"),
       m_model(),
       m_spiFail(false),
+      m_overrideModemStatus(false),
+      m_modemStatus(0),
       m_allocFail(false),
       m_allocation{},
       m_pendingCompletionValid(false),
@@ -74,6 +76,10 @@ void Rfm9XManagerTester ::from_spiWriteRead_handler(FwIndexType portNum,
     } else {
         EXPECT_EQ(writeBuffer.getSize(), readBuffer.getSize());
         this->m_model.spiTransaction(writeBuffer.getData(), readBuffer.getData(), writeBuffer.getSize());
+        if (this->m_overrideModemStatus && writeBuffer.getSize() == 2 &&
+            writeBuffer.getData()[0] == Reg::MODEM_STAT) {
+            readBuffer.getData()[1] = this->m_modemStatus;
+        }
     }
     // Must NOT call invoke_to_spiWriteReadComplete() here: this handler can
     // run while the component already holds its own m_lock (e.g. issued
@@ -156,6 +162,7 @@ void Rfm9XManagerTester ::makeReady() {
     this->runUntilReady();
     ASSERT_EVENTS_ConfigurationFailed_SIZE(0);
     ASSERT_from_comStatusOut(0, Fw::Success(Fw::Success::SUCCESS));
+    this->runTicks(4);
     this->clearHistory();
 }
 
@@ -259,8 +266,7 @@ void Rfm9XManagerTester ::test_detection_radio_absent() {
 
 void Rfm9XManagerTester ::test_transmit_channel_busy() {
     this->makeReady();
-    // A carrier on the channel asserts RegModemStat activity in RX:
-    // listen-before-talk must defer the downlink with FAILURE.
+    // A detected signal defers the downlink with FAILURE.
     this->m_model.setChannelBusy(true);
     this->runUntilChannelBusyRefreshed();
     this->clearHistory();
@@ -281,6 +287,92 @@ void Rfm9XManagerTester ::test_transmit_channel_busy() {
     this->runUntilTransmitCompletes();
     ASSERT_from_comStatusOut(0, Fw::Success(Fw::Success::SUCCESS));
     ASSERT_TLM_PacketsTransmitted(0, 1);
+}
+
+void Rfm9XManagerTester ::test_command_signal_gate() {
+    this->makeReady();
+    this->m_overrideModemStatus = true;
+    this->m_modemStatus = ModemStat::SIGNAL_DETECTED;
+    this->runUntilChannelBusyRefreshed();
+    this->clearHistory();
+    const Fw::CmdStringArg payload("test");
+    this->sendCmd_SEND_STRING(0, 0, payload);
+    ASSERT_CMD_RESPONSE(0, Rfm9XManagerComponentBase::OPCODE_SEND_STRING, 0, Fw::CmdResponse::EXECUTION_ERROR);
+    ASSERT_EVENTS_SendFailed(0, Rfm9XSendFailure::NOT_READY);
+
+    this->m_modemStatus = ModemStat::RX_ONGOING;
+    this->runUntilChannelBusyRefreshed();
+    this->clearHistory();
+    this->sendCmd_SEND_STRING(0, 1, payload);
+    ASSERT_CMD_RESPONSE(0, Rfm9XManagerComponentBase::OPCODE_SEND_STRING, 1, Fw::CmdResponse::OK);
+    for (U32 tick = 0; tick < 4096 && this->tlmHistory_PacketsTransmitted->size() == 0; tick++) {
+        this->invoke_to_run(0, 0);
+    }
+    ASSERT_TLM_PacketsTransmitted(0, 1);
+}
+
+void Rfm9XManagerTester ::test_com_signal_gate() {
+    this->makeReady();
+    this->m_overrideModemStatus = true;
+    this->m_modemStatus = ModemStat::SIGNAL_DETECTED;
+    this->runUntilChannelBusyRefreshed();
+    this->clearHistory();
+    U8 data[4] = {1, 2, 3, 4};
+    Fw::Buffer buffer(data, sizeof data);
+    ComCfg::FrameContext context;
+    this->invoke_to_dataIn(0, buffer, context);
+    ASSERT_from_comStatusOut(0, Fw::Success(Fw::Success::FAILURE));
+    ASSERT_from_dataReturnOut_SIZE(1);
+
+    this->m_modemStatus = ModemStat::RX_ONGOING;
+    this->runUntilChannelBusyRefreshed();
+    this->clearHistory();
+    this->invoke_to_dataIn(0, buffer, context);
+    this->runUntilTransmitCompletes();
+    ASSERT_from_comStatusOut(0, Fw::Success(Fw::Success::SUCCESS));
+    ASSERT_TLM_PacketsTransmitted(0, 1);
+}
+
+void Rfm9XManagerTester ::test_status_read_required() {
+    this->makeReady();
+    const Fw::CmdStringArg payload("test");
+    this->m_spiFail = true;
+    this->runTicks(4);
+    this->clearHistory();
+    this->sendCmd_SEND_STRING(0, 3, payload);
+    ASSERT_CMD_RESPONSE(0, Rfm9XManagerComponentBase::OPCODE_SEND_STRING, 3, Fw::CmdResponse::EXECUTION_ERROR);
+    this->m_spiFail = false;
+    this->runTicks(4);
+
+    this->sendCmd_RESET(0, 0);
+    this->clearHistory();
+    this->runUntilReady();
+    this->sendCmd_SEND_STRING(0, 0, payload);
+    ASSERT_CMD_RESPONSE(0, Rfm9XManagerComponentBase::OPCODE_SEND_STRING, 0, Fw::CmdResponse::EXECUTION_ERROR);
+
+    this->m_spiFail = true;
+    this->runTicks(4);
+    this->clearHistory();
+    U8 data[4] = {1, 2, 3, 4};
+    Fw::Buffer buffer(data, sizeof data);
+    ComCfg::FrameContext context;
+    this->invoke_to_dataIn(0, buffer, context);
+    ASSERT_from_comStatusOut(0, Fw::Success(Fw::Success::FAILURE));
+    this->sendCmd_SEND_STRING(0, 1, payload);
+    ASSERT_CMD_RESPONSE(0, Rfm9XManagerComponentBase::OPCODE_SEND_STRING, 1, Fw::CmdResponse::EXECUTION_ERROR);
+
+    this->m_spiFail = false;
+    this->runTicks(4);
+    this->paramSet_SPREADING_FACTOR(SpreadingFactor::SF9, Fw::ParamValid::VALID);
+    this->paramSend_SPREADING_FACTOR(0, 4);
+    this->clearHistory();
+    this->runUntilReady();
+    this->sendCmd_SEND_STRING(0, 5, payload);
+    ASSERT_CMD_RESPONSE(0, Rfm9XManagerComponentBase::OPCODE_SEND_STRING, 5, Fw::CmdResponse::EXECUTION_ERROR);
+    this->runTicks(4);
+    this->clearHistory();
+    this->sendCmd_SEND_STRING(0, 2, payload);
+    ASSERT_CMD_RESPONSE(0, Rfm9XManagerComponentBase::OPCODE_SEND_STRING, 2, Fw::CmdResponse::OK);
 }
 
 void Rfm9XManagerTester ::test_transmit_mode_settle() {
@@ -598,6 +690,7 @@ void Rfm9XManagerTester ::test_bandwidth_update_reconfigure() {
     // Bw=1000 (250kHz) | CodingRate=001 (4/5) << 1
     ASSERT_EQ(this->m_model.readRegisterValue(Reg::MODEM_CONFIG_1), 0x82);
 
+    this->runTicks(4);
     this->clearHistory();
     U8 data[8] = {0, 1, 2, 3, 4, 5, 6, 7};
     Fw::Buffer buffer(data, sizeof data);
@@ -669,6 +762,7 @@ void Rfm9XManagerTester ::test_parameter_update_reconfigure() {
     ASSERT_EQ(this->m_model.readRegisterValue(Reg::MODEM_CONFIG_2), 0x94);
     ASSERT_from_comStatusOut_SIZE(0);
 
+    this->runTicks(4);
     this->clearHistory();
     U8 data[8] = {0, 1, 2, 3, 4, 5, 6, 7};
     Fw::Buffer buffer(data, sizeof data);
@@ -699,6 +793,7 @@ void Rfm9XManagerTester ::test_reset_recovery() {
     ASSERT_from_resetGpio(1, Fw::Logic::HIGH);
     ASSERT_from_comStatusOut_SIZE(0);
 
+    this->runTicks(4);
     this->clearHistory();
     U8 data[8] = {7, 6, 5, 4, 3, 2, 1, 0};
     Fw::Buffer buffer(data, sizeof data);
@@ -1016,6 +1111,7 @@ void Rfm9XManagerTester ::test_reset_during_transmit() {
     this->clearHistory();
     this->runUntilReady();
     ASSERT_EVENTS_RadioReady_SIZE(1);
+    this->runTicks(4);
     this->clearHistory();
     this->invoke_to_dataIn(0, buffer, context);
     this->runUntilTransmitCompletes();

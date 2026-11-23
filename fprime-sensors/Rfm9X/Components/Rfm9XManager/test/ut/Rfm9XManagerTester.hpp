@@ -146,6 +146,10 @@ class Rfm9XManagerTester : public Rfm9XManagerGTestBase {
     //! A busy RF channel (RegModemStat) defers downlink until clear
     void test_transmit_channel_busy();
 
+    void test_command_signal_gate();
+    void test_com_signal_gate();
+    void test_status_read_required();
+
     //! Oscillator/PLL settling delays are tolerated
     void test_transmit_mode_settle();
 
@@ -265,6 +269,9 @@ class Rfm9XManagerTester : public Rfm9XManagerGTestBase {
 
     //! Force SPI transactions to fail
     bool m_spiFail;
+
+    bool m_overrideModemStatus;
+    U8 m_modemStatus;
 
     //! Force allocations to fail (return an empty buffer)
     bool m_allocFail;

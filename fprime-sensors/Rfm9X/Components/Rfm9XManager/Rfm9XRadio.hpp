@@ -80,10 +80,9 @@ constexpr U8 FHSS_CHANGE_CHANNEL = 0x02;
 constexpr U8 CAD_DETECTED = 0x01;
 }  // namespace IrqFlags
 
-//! RegModemStat bit masks (datasheet section 6.4, address 0x18). Used as the
-//! LoRa channel-busy signal (RxOngoing/SignalDetected), replacing FSK's
-//! IrqFlags1.SyncAddressMatch: LoRa has no equivalent IRQ flag, but
-//! RegModemStat reports live demodulator activity.
+//! RegModemStat bit masks (datasheet section 6.4, address 0x18).
+//! SignalDetected is used for a best-effort busy check, not channel-clear
+//! assessment. RxOngoing has been observed set on an idle receiver.
 namespace ModemStat {
 constexpr U8 MODEM_CLEAR = 0x10;
 constexpr U8 HEADER_INFO_VALID = 0x08;

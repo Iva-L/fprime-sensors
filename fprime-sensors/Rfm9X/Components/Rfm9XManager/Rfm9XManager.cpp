@@ -35,7 +35,7 @@ Rfm9XManager ::Rfm9XManager(const char* const compName)
       m_spiOpOrigin(SPI_OP_NONE),
       m_configureStep(0),
       m_rxState(RX_IDLE),
-      m_lastChannelBusy(false),
+      m_lastChannelBusy(true),
       m_rxIrqFlags(0),
       m_rxPacketLength(0),
       m_txActive(false),
@@ -150,6 +150,7 @@ void Rfm9XManager ::parameterUpdated(FwPrmIdType id) {
     if (this->m_state == READY) {
         this->m_state = CONFIGURE;
         this->m_configureStep = 0;
+        this->m_lastChannelBusy = true;
     }
 }
 
@@ -597,6 +598,7 @@ void Rfm9XManager ::continueInitializeRadio(const Drv::SpiStatus& status) {
     // Last step's completion: RX_CONTINUOUS was requested successfully.
     this->m_state = READY;
     this->m_configureStep = 0;
+    this->m_lastChannelBusy = true;
     this->reportRadioState();
     this->m_pendingOutputs.logRadioReady = true;
     // Com status is a one-time startup handshake. Sending an extra SUCCESS
@@ -614,6 +616,7 @@ void Rfm9XManager ::beginResetSequence() {
     this->m_configureStep = 0;
     this->m_spiOpOrigin = SPI_OP_NONE;
     this->m_rxState = RX_IDLE;
+    this->m_lastChannelBusy = true;
     this->reportRadioState();
 }
 
@@ -814,12 +817,7 @@ void Rfm9XManager ::continueReceivePoll(const Drv::SpiStatus& status) {
 
     switch (this->m_rxState) {
         case RX_CHECK_BUSY: {
-            // A bus fault reads as "clear" so the transmit path is taken and
-            // its own SPI failure handling reports RADIO_FAULT instead of
-            // silently deferring downlink forever on a dead bus.
-            const U8 stat = ok ? this->m_miso[1] : 0;
-            this->m_lastChannelBusy =
-                ok && ((stat & static_cast<U8>(ModemStat::RX_ONGOING | ModemStat::SIGNAL_DETECTED)) != 0);
+            this->m_lastChannelBusy = !ok || ((this->m_miso[1] & ModemStat::SIGNAL_DETECTED) != 0);
             this->issueReadRegister(Reg::IRQ_FLAGS, SPI_OP_RX);
             this->m_rxState = RX_CHECK_FLAGS;
             break;
