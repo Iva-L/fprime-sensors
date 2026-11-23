@@ -46,13 +46,13 @@ module Rfm9X {
         @ single-packet headroom.
         constant MAX_PAYLOAD_LENGTH = 255
 
-        @ Depth of the local ground-station pending-TX hold queue (used only
+        @ Depth of the local pending-TX hold queue (used only
         @ when comStatusOut is unwired, i.e. no ComQueue retry path -- see
         @ Rfm9XManager::usesLocalTxHold()). Each slot costs one Fw::Buffer +
         @ one ComCfg::FrameContext (roughly 168 bytes on a 32-bit target),
         @ the single largest RAM cost in this component at the default depth
-        @ of 8. A flight deployment with a real ComQueue wired up never
-        @ fills this queue and can set it to 0 or 1.
+        @ of 8. A deployment with ComQueue wired up does not fill this queue
+        @ and can reduce its depth.
         constant PENDING_TX_DEPTH = 8
     }
 }

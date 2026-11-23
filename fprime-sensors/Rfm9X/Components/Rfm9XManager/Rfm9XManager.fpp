@@ -16,7 +16,7 @@ module Rfm9X {
 
     @ LoRa signal bandwidth (RegModemConfig1.Bw, datasheet section 6.4). Values
     @ are the full 10-entry Bw field range; 250/500 kHz are unsupported on the
-    @ low-frequency (169 MHz) band per datasheet, not applicable at 434 MHz.
+    @ low-frequency (169 MHz) band per datasheet.
     enum Bandwidth : U32 {
         BW_7_8_KHZ = 7800
         BW_10_4_KHZ = 10400
@@ -58,11 +58,11 @@ module Rfm9X {
 
     @ Reason a staged downlink packet was not sent.
     enum Rfm9XSendFailure : U8 {
-        @ Payload was empty or exceeded the 255-byte RFM9X packet limit
+        @ Payload was empty or exceeded the configured packet limit
         INVALID_SIZE
-        @ SPI error or mode/PacketSent timeout; the radio was recovered to RX
+        @ SPI error or TxDone timeout; RX recovery was attempted
         RADIO_FAULT
-        @ Local pending-transmit hold was full (ground station only)
+        @ Local pending-transmit hold was full (comStatusOut unconnected)
         QUEUE_FULL
         @ Radio not READY, a transmit is already active, the channel is busy,
         @ downlink is disabled, or transmission is otherwise blocked
@@ -102,7 +102,7 @@ module Rfm9X {
 
         @ SPI bus transactions with the radio: issue a request, then resume
         @ from spiWriteReadComplete once the driver's completion callback
-        @ fires -- never a blocking call. Matches the Stm32SpiDriver
+        @ fires. Matches the Stm32SpiDriver
         @ spiWriteReadAsync/spiWriteReadAsyncComplete port pair (and, for a
         @ SAMD21 deployment, Samd21::SpiDriver's SpiWriteRead/
         @ SpiWriteReadComplete) one-for-one, so no adapter component is
@@ -111,11 +111,8 @@ module Rfm9X {
 
         @ Completion callback for the request above. sync, not async: FPP
         @ forbids async input on a passive component, and the driver's own
-        @ poll() (both Stm32SpiDriver's and, via activeIn, Samd21::SpiDriver's)
-        @ already invokes the completion port from ordinary non-interrupt
-        @ call context, never from a real ISR -- a synchronous call back into
-        @ this handler is therefore safe, matching how Stm32UartDriver::poll()
-        @ itself calls other sync ports (allocate_out/recv_out) directly.
+        @ completion is handled synchronously. The deployment must serialize
+        @ handler execution and provide a completion for each request.
         sync input port spiWriteReadComplete: Drv.SpiWriteReadCallback
 
         @ Drives either a dedicated NRESET line or a power-enable/load-switch
@@ -152,18 +149,17 @@ module Rfm9X {
         # Parameters
         # ----------------------------------------------------------------------
 
-        @ LoRa spreading factor. Default SF7 matches the project's 434 MHz
-        @ operating point. Ground Station must match.
+        @ LoRa spreading factor. The peer must use the same setting.
         param SPREADING_FACTOR: SpreadingFactor default SpreadingFactor.SF7 id 0
 
-        @ LoRa signal bandwidth. Default 125 kHz matches the ground-station image.
+        @ LoRa signal bandwidth. The peer must use the same setting.
         param BANDWIDTH: Bandwidth default Bandwidth.BW_125_KHZ id 1
 
-        @ LoRa error coding rate. Default 4/5 matches the ground-station image.
+        @ LoRa error coding rate. The peer must use the same setting.
         param CODING_RATE: CodingRate default CodingRate.CR_4_5 id 2
 
-        @ RF carrier frequency in Hz. Default 434.0 MHz matches the project's
-        @ stated operating band (datasheet section 6.4, RegFrLsb).
+        @ RF carrier frequency in Hz. The deployment must select a frequency
+        @ compatible with its hardware and operating region.
         param FREQUENCY_HZ: U32 default 434000000 id 3
 
         @ HCW transmitter power configuration, including PA boost when needed.
@@ -210,7 +206,7 @@ module Rfm9X {
         @ Successful RF packet transmissions
         telemetry PacketsTransmitted: U32
 
-        @ RF packets delivered on dataOut
+        @ RF packets successfully read from the FIFO
         telemetry PacketsReceived: U32
 
         @ RX frames dropped for failing hardware CRC (noise / corrupted uplink).

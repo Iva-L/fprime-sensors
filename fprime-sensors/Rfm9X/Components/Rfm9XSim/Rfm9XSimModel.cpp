@@ -44,7 +44,7 @@ void Rfm9XSimModel::reset() {
     (void)::memset(this->m_airBuffer, 0, sizeof this->m_airBuffer);
     (void)::memset(this->m_txQueue, 0, sizeof this->m_txQueue);
     (void)::memset(this->m_txSizes, 0, sizeof this->m_txSizes);
-    // datasheet section 6.1/6.4 reset values for registers the manager interacts with
+    // Modeled starting values; OP_MODE intentionally starts in LoRa standby.
     this->m_registers[Reg::OP_MODE] = static_cast<U8>(Mode::LONG_RANGE_MODE | Mode::STANDBY);
     this->m_registers[Reg::FRF_MSB] = 0x6C;
     this->m_registers[Reg::FRF_MID] = 0x80;

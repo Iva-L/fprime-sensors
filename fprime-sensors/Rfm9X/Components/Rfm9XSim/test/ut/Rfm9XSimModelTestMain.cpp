@@ -67,7 +67,7 @@ class Rfm9XSimModelTest : public ::testing::Test {
 // ----------------------------------------------------------------------
 
 TEST_F(Rfm9XSimModelTest, ResetRegisterDefaults) {
-    // datasheet section 6.1/6.4 power-on values the manager relies on
+    // Modeled starting values, including the intentional LoRa standby mode.
     EXPECT_EQ(this->readReg(Reg::VERSION), VERSION_VALUE);
     EXPECT_EQ(this->readReg(Reg::OP_MODE) & Mode::LONG_RANGE_MODE, Mode::LONG_RANGE_MODE);
     EXPECT_EQ(this->readReg(Reg::OP_MODE) & Mode::MASK, Mode::STANDBY);

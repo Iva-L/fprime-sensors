@@ -7,9 +7,8 @@
 // Used by the Rfm9XSim component and by the Rfm9XManager unit tests.
 //
 // Time is modeled with a byte clock: each SPI byte exchanged advances
-// the modeled air interface by one byte time, so TX/RX airtime is paced
-// against the manager's polling the same way the real radio's airtime
-// is paced against the SPI clock.
+// the synthetic clock; an air step occurs every AIR_CLOCK_DIVISOR byte
+// clocks. This is a test pacing mechanism, not real LoRa airtime.
 // ======================================================================
 
 #ifndef Rfm9X_Rfm9XSimModel_HPP
@@ -57,7 +56,7 @@ class Rfm9XSimModel {
     //! but PayloadCrcError asserts alongside it, matching datasheet section
     //! 4.1.5: "The PayloadCrcError flag should be checked for packet
     //! integrity." Used to verify the manager drops such frames instead of
-    //! forwarding them to the deframer.
+    //! forwarding them to the consumer.
     void injectCorruptFrame(U8 payloadLen);
 
     //! Retrieve the next transmitted packet payload (downlink).
@@ -82,9 +81,8 @@ class Rfm9XSimModel {
     //! functional API.
     bool wasRegisterWritten(U8 address, U8 value) const;
 
-    //! Model oscillator/PLL settling: no packet-engine byte-clock activity
-    //! for `byteTimes` byte clocks after every mode change, as on real
-    //! hardware. Zero restores instant settling.
+    //! Suppress packet-engine activity for `byteTimes` simulated byte clocks
+    //! after a mode change. Zero restores instant settling.
     void setModeSettleByteTimes(FwSizeType byteTimes);
 
     //! Model an absent or unpowered radio: SPI reads return zero and writes
@@ -98,8 +96,7 @@ class Rfm9XSimModel {
     void setSnrReadback(U8 value);
 
     //! Model a busy RF channel: RegModemStat reports RX ongoing / signal
-    //! detected even with no packet in delivery, exercising listen-before-talk
-    //! holdoff.
+    //! detected even with no packet in delivery, exercising the signal gate.
     void setChannelBusy(bool busy);
 
   private:
@@ -164,12 +161,11 @@ class Rfm9XSimModel {
     FwSizeType m_txElapsed;
     U8 m_txAccum[MAX_PACKET_PAYLOAD];
 
-    // In-progress reception: bytes stream into the FIFO buffer by the byte
-    // clock, starting at the RX base address captured when reception began.
+    // In-progress reception: a byte-clock count delays the completed packet
+    // copy into the FIFO at the RX base address.
     bool m_rxActive;
     //! True once RxDone has been asserted but not yet acknowledged (cleared)
-    //! by the host. Blocks starting a new reception, mirroring real hardware
-    //! holding the completed packet in the FIFO until the host reads it out.
+    //! by the host. The model blocks a new reception until it is cleared.
     bool m_rxPendingDelivery;
     U8 m_rxStartAddr;
     FwSizeType m_rxTotal;

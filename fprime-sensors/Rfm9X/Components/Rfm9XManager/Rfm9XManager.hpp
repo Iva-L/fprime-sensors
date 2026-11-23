@@ -111,10 +111,7 @@ class Rfm9XManager final : public Rfm9XManagerComponentBase {
         TX_FAILED
     };
 
-    //! Receive-side sequence, advanced one SPI op per spiWriteReadComplete
-    //! callback. Mirrors TxState's one-op-per-step shape; replaces the old
-    //! synchronous tryDeliverReceivedPacket() (7 sequential SPI ops in one
-    //! call) now that SPI is async.
+    //! Receive-side sequence, advanced one SPI op per completion callback.
     enum RxState {
         RX_IDLE,            //!< No RX op in flight; run() may start RX_CHECK_BUSY
         RX_CHECK_BUSY,      //!< Reading MODEM_STAT (channelBusy() cache source)
@@ -183,9 +180,7 @@ class Rfm9XManager final : public Rfm9XManagerComponentBase {
     // Helper functions: radio state management (Rfm9XManager.cpp)
     // ----------------------------------------------------------------------
 
-    //! Start the next bounded step of whichever sequence is active (bring-up,
-    //! TX, or RX) by issuing exactly one SPI request -- a no-op if one is
-    //! already outstanding (m_spiOpOrigin != SPI_OP_NONE).
+    //! Advance the bring-up state. Called only when no SPI request is outstanding.
     void initializeRadio();
 
     //! Resume the bring-up CONFIGURE step sequence from the result of the
@@ -203,17 +198,9 @@ class Rfm9XManager final : public Rfm9XManagerComponentBase {
     //! Allocate and emit a received packet on dataOut (outside m_lock)
     void deliverReceivedPacket(const U8* data, FwSizeType size);
 
-    //! Enter the tick-driven hardware reset sequence (or DETECT when the
-    //! optional RST line is unwired). Also clears m_spiOpOrigin to
-    //! SPI_OP_NONE and m_rxState to RX_IDLE: a request issued before this
-    //! call may still be outstanding at the driver (every request is
-    //! eventually answered, even an abandoned one), and this component is
-    //! single-threaded (command handlers, run(), and
-    //! spiWriteReadComplete_handler() all execute on the same cyclic
-    //! executive, never concurrently), so clearing the origin here is
-    //! enough to make spiWriteReadComplete_handler() drop that stale
-    //! completion when it eventually arrives, rather than resuming a TX/RX
-    //! sequence that RESET has already discarded.
+    //! Enter the tick-driven reset sequence and discard the current SPI/RX
+    //! state. A completion for a discarded request is ignored if it arrives
+    //! before another request is started. The deployment must serialize calls.
     void beginResetSequence();
 
     //! Map the internal lifecycle state to telemetry and write the channel.
@@ -223,21 +210,18 @@ class Rfm9XManager final : public Rfm9XManagerComponentBase {
     bool startTransmit(Fw::Buffer& data, const ComCfg::FrameContext& context);
 
     //! True when this deployment has no ComQueue retry path (comStatusOut unwired).
-    //! Ground-station topologies use a local pending-TX hold instead of dropping.
+    //! Such deployments use a local pending-TX hold instead of dropping.
     bool usesLocalTxHold() const;
 
-    //! Enqueue one uplink buffer for a later run() tick. Returns false if full.
+    //! Enqueue one buffer for a later run() tick. Returns false if full.
     bool enqueuePendingTransmit(Fw::Buffer& data, const ComCfg::FrameContext& context);
 
-    //! If idle and clear, start the oldest pending uplink packet.
+    //! If idle and clear, start the oldest pending packet.
     //! Returns true when dropBuffer/dropContext must be returned after unlock.
     bool tryStartPendingTransmit(Fw::Buffer& dropBuffer, ComCfg::FrameContext& dropContext);
 
-    //! Start the TX sequence's next bounded step (one SPI op) if idle;
-    //! a no-op if another sequence (bring-up/RX) is outstanding. Returns
-    //! TX_IN_PROGRESS unless this call issues no further SPI request this
-    //! tick (nothing to start, or still waiting on run()'s own tick-driven
-    //! TX_WAIT_TXDONE check).
+    //! Issue the TX sequence's next SPI request. Returns TX_IN_PROGRESS;
+    //! completion reports success or failure through continueAdvanceTransmit().
     TxProgress advanceTransmit();
 
     //! Resume the TX sequence from the result of the request
@@ -291,9 +275,9 @@ class Rfm9XManager final : public Rfm9XManagerComponentBase {
                           SpiOpOrigin origin  //!< Sequence to resume on completion
     );
 
-    //! \brief True when a reception is in progress (defer TX via Com FAILURE).
-    //! Pure accessor: no SPI call. Reads m_lastChannelBusy, refreshed once
-    //! per RX_IDLE->RX_CHECK_BUSY step (bounded staleness, see RxState).
+    //! \brief True when the cached modem status indicates a detected signal.
+    //! Pure accessor: no SPI call. Reads the last SignalDetected sample,
+    //! or busy if a successful sample has not yet been obtained.
     bool channelBusy();
 
     //! \brief True when downlink should wait (RX in progress or post-RX holdoff)
@@ -312,9 +296,8 @@ class Rfm9XManager final : public Rfm9XManagerComponentBase {
     void applyRssiReading(U8 rawValue);
     void applySnrReading(U8 rawValue);
 
-    //! Every output-port call (spiWriteRead_out, log_*, tlmWrite_*,
-    //! comStatusOut_out) reached from code that runs under m_lock stages its
-    //! call here instead of calling directly.
+    //! SPI requests and selected event, telemetry, and Com status outputs
+    //! are staged here for dispatch after releasing m_lock.
     struct PendingOutputs {
         bool spiRequest = false;
         FwIndexType spiRequestPortNum = 0;
@@ -349,21 +332,16 @@ class Rfm9XManager final : public Rfm9XManagerComponentBase {
     //! Call every output port named by a pending flag/value in
     //! m_pendingOutputs, then clear it. Must be called only after m_lock has
     //! been released -- run_handler()/spiWriteReadComplete_handler() are the
-    //! sole callers, immediately after their own lock scope closes. Safe as
-    //! a single member (not a value threaded through every helper's
-    //! signature) because this component is single-threaded: run(),
-    //! spiWriteReadComplete(), and the command handlers never execute
-    //! concurrently, so at most one lock scope -- and therefore one batch of
-    //! staged outputs -- is ever open at a time.
+    //! callers also include dataIn and RESET. The deployment must serialize
+    //! handlers: the shared batch is not protected during dispatch.
     void flushPendingOutputs();
 
     // ----------------------------------------------------------------------
     // Member variables
     // ----------------------------------------------------------------------
 
-    //! Serializes radio access between dataIn (com queue thread) and run
-    //! (rate group thread): both drive multi-transaction SPI sequences and
-    //! share the SPI scratch buffers
+    //! Protects radio state while handlers prepare their work. The deployment
+    //! must also serialize handlers around staged-output dispatch.
     Os::Mutex m_lock;
 
     //! Which sequence (if any) has an SPI request outstanding. Only
@@ -374,9 +352,8 @@ class Rfm9XManager final : public Rfm9XManagerComponentBase {
     SpiOpOrigin m_spiOpOrigin;
 
     //! Current step of the bring-up CONFIGURE sequence (one write per
-    //! continueInitializeRadio() call): 0-2 are enterLoRaMode()'s three
-    //! writes, 3..3+N-1 are the configuration[] table entries, the next is
-    //! the IRQ-flags clear, the last is requestMode(RX_CONTINUOUS).
+    //! continueInitializeRadio() call): 0-2 enter LoRa mode, followed by
+    //! the configuration table, IRQ clear, and RX_CONTINUOUS request.
     U32 m_configureStep;
 
     //! Current step of the RX sequence (one SPI op per
@@ -384,8 +361,7 @@ class Rfm9XManager final : public Rfm9XManagerComponentBase {
     RxState m_rxState;
     //! Cached result of the RX_CHECK_BUSY step's MODEM_STAT read, returned
     //! by channelBusy() without issuing a fresh SPI transaction. Staleness
-    //! is bounded by the RX_IDLE->RX_CHECK_BUSY cadence (once per idle RX
-    //! poll cycle), comfortably inside LoRa packet airtimes.
+    //! depends on the RX poll cadence and SPI completion latency.
     bool m_lastChannelBusy;
     //! IRQ_FLAGS byte latched by RX_CHECK_FLAGS, consulted by RX_CLEAR_FLAGS
     //! (to decide RxDone/CRC-error) and by RX_READ_LENGTH's caller.
@@ -400,16 +376,8 @@ class Rfm9XManager final : public Rfm9XManagerComponentBase {
     Fw::Buffer m_txBuffer;            //!< Downlink buffer owned by the TX machine
     ComCfg::FrameContext m_txContext; //!< Frame context returned with m_txBuffer
     U32 m_txWaitTicks;                //!< Ticks spent waiting for TxDone
-    //! Local hold used when comStatusOut is unwired (no ComQueue). Mirrors the
-    //! Arduino RadioHead ground-station usbHold/retry behavior for half-duplex.
-    //! Depth comes from Rfm9X.ManagerCfg.PENDING_TX_DEPTH -- see that
-    //! constant's own doc comment: each slot costs one Fw::Buffer + one
-    //! ComCfg::FrameContext (~168 bytes on a 32-bit target), the single
-    //! largest RAM cost in this component at the library default of 8
-    //! (sized to the GS frame-bin pool so a short GDS burst cannot overflow
-    //! and drop mid-file CFDP DATA packets). A deployment with a real
-    //! ComQueue wired to comStatusOut (usesLocalTxHold() false) never fills
-    //! this queue and can override it down to 0 or 1.
+    //! Local hold used when comStatusOut is unwired. Each slot contains an
+    //! Fw::Buffer and ComCfg::FrameContext; depth is deployment-configurable.
     static constexpr U32 PENDING_TX_DEPTH = Rfm9X::ManagerCfg::PENDING_TX_DEPTH;
     Fw::Buffer m_pendingTxBuffers[PENDING_TX_DEPTH];
     ComCfg::FrameContext m_pendingTxContexts[PENDING_TX_DEPTH];
@@ -420,7 +388,7 @@ class Rfm9XManager final : public Rfm9XManagerComponentBase {
     U8 m_rxPayload[MAX_PACKET_PAYLOAD];
     static_assert(sizeof(m_rxPayload) == MAX_PACKET_PAYLOAD,
                   "RX delivery bounds checks assume m_rxPayload holds MAX_PACKET_PAYLOAD bytes");
-    //! Remaining run() ticks to defer flight downlink after a completed RX
+    //! Remaining run() ticks to defer ComQueue transmission after RX
     U32 m_rxTxHoldoffTicks;
     //! Remaining run() ticks to defer the next local TX after a completed TX
     U32 m_txTxHoldoffTicks;
@@ -470,14 +438,14 @@ class Rfm9XManager final : public Rfm9XManagerComponentBase {
     //! flushPendingOutputs() after the lock releases.
     PendingOutputs m_pendingOutputs;
 
-    //! One entry of configureRadio()'s modem-profile register table.
+    //! One entry of the modem-profile register table.
     struct ConfigEntry {
         U8 address;
         U8 value;
     };
     //! The modem-profile register table itself, populated once by
     //! continueInitializeRadio() the first time it enters the
-    //! post-enterLoRaMode() steps (from current FPP parameters) and then
+    //! configuration steps (from current FPP parameters) and then
     //! walked one entry per subsequent step via m_configureStep.
     static constexpr FwSizeType CONFIG_TABLE_SIZE = 16;
     ConfigEntry m_configTable[CONFIG_TABLE_SIZE];

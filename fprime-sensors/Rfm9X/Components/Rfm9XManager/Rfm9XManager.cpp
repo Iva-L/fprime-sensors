@@ -166,14 +166,14 @@ void Rfm9XManager ::parametersLoaded() {
 void Rfm9XManager ::dataIn_handler(FwIndexType portNum, Fw::Buffer& data, const ComCfg::FrameContext& context) {
     // Accepting a buffer only stages it. RF airtime is advanced by run(), so
     // this handler remains bounded even when a Com SUCCESS callback reaches it
-    // synchronously from the 1 kHz rate-group thread.
+    // synchronously from a rate-group thread.
     bool accepted = false;
     bool held = false;
     {
         Os::ScopeLock lock(this->m_lock);
         if (this->m_transmitEnabled == TransmitState::DISABLED) {
-            // Keep a local hold on GS (no ComQueue); flight reports FAILURE so
-            // ComQueue retries after TRANSMIT is re-enabled.
+            // Hold locally without a status connection; otherwise report
+            // FAILURE so the upstream queue can retry when enabled.
             if (this->usesLocalTxHold()) {
                 held = this->enqueuePendingTransmit(data, context);
             } else {
@@ -181,9 +181,8 @@ void Rfm9XManager ::dataIn_handler(FwIndexType portNum, Fw::Buffer& data, const 
             }
         } else if ((this->m_state != READY) || this->m_txActive || this->channelBusy() ||
                    (this->usesLocalTxHold() && (this->m_txTxHoldoffTicks > 0))) {
-            // Half-duplex / not ready: ComQueue gets FAILURE; GS holds & retries.
-            // GS ignores RX_TX_HOLDOFF (continuous TM would starve uplink) but
-            // honors TX_TX_HOLDOFF so bursts cannot send back-to-back packets.
+            // An unconnected status port selects local hold; otherwise the
+            // upstream queue receives FAILURE and retries.
             if (this->usesLocalTxHold()) {
                 held = this->enqueuePendingTransmit(data, context);
             } else {
@@ -192,7 +191,7 @@ void Rfm9XManager ::dataIn_handler(FwIndexType portNum, Fw::Buffer& data, const 
                 this->m_comResumeNeeded = true;
             }
         } else if (this->downlinkBlocked() && !this->usesLocalTxHold()) {
-            // Flight ComQueue path still respects holdoff via FAILURE/resume.
+            // The ComQueue path respects holdoff via FAILURE/resume.
             this->m_comResumeNeeded = true;
         } else if (this->usesLocalTxHold() && (this->m_pendingTxCount > 0)) {
             // Keep FIFO order: a new frame must not jump ahead of held frames.
@@ -226,53 +225,53 @@ void Rfm9XManager ::run_handler(FwIndexType portNum, U32 context) {
     ComCfg::FrameContext dropContext;
     bool dropPending = false;
     {
-    Os::ScopeLock lock(this->m_lock);
-    if (this->m_spiOpOrigin == SPI_OP_NONE) {
-        // Only start a *new* bounded step when no SPI request is already
-        // outstanding; progress on an outstanding one happens from
-        // spiWriteReadComplete_handler() as soon as the driver's completion
-        // callback fires, not from this tick.
-        if (this->m_txActive) {
-            (void)this->advanceTransmit();
-        } else if (this->m_state == READY) {
-            // Drain local GS hold before RX poll so uplink is not starved by TM.
-            dropPending = this->tryStartPendingTransmit(dropBuffer, dropContext);
-            if (!dropPending && !this->m_txActive) {
-                this->pollReceive();
+        Os::ScopeLock lock(this->m_lock);
+        if (this->m_spiOpOrigin == SPI_OP_NONE) {
+            // Only start a *new* bounded step when no SPI request is already
+            // outstanding; progress on an outstanding one happens from
+            // spiWriteReadComplete_handler() as soon as the driver's completion
+            // callback fires, not from this tick.
+            if (this->m_txActive) {
+                (void)this->advanceTransmit();
+            } else if (this->m_state == READY) {
+                // Start a held packet before polling RX.
+                dropPending = this->tryStartPendingTransmit(dropBuffer, dropContext);
+                if (!dropPending && !this->m_txActive) {
+                    this->pollReceive();
+                }
+            } else {
+                // Bring-up advances here one bounded step per tick; also covers
+                // RESET, parameter reconfigure, and failed-detect retries.
+                this->initializeRadio();
+            }
+        }
+        if (this->m_rxTxHoldoffTicks > 0) {
+            this->m_rxTxHoldoffTicks--;
+        }
+        if (this->m_txTxHoldoffTicks > 0) {
+            this->m_txTxHoldoffTicks--;
+        }
+        // Downlink fairness: each received packet re-arms the RX lease, so
+        // periodic uplink (GDS keepalives, paced file chunks) can otherwise defer
+        // a pending downlink forever. Bound the total wait and drop the lease.
+        if (this->m_comResumeNeeded && (this->m_state == READY) &&
+            (this->m_transmitEnabled == TransmitState::ENABLED) && (this->m_rxTxHoldoffTicks > 0)) {
+            if (++this->m_txStarvedTicks >= this->m_rxHoldoffStarvationTicks) {
+                this->m_txStarvedTicks = 0;
+                this->m_rxTxHoldoffTicks = 0;
             }
         } else {
-            // Bring-up advances here one bounded step per tick; also covers
-            // RESET, parameter reconfigure, and failed-detect retries.
-            this->initializeRadio();
-        }
-    }
-    if (this->m_rxTxHoldoffTicks > 0) {
-        this->m_rxTxHoldoffTicks--;
-    }
-    if (this->m_txTxHoldoffTicks > 0) {
-        this->m_txTxHoldoffTicks--;
-    }
-    // Downlink fairness: each received packet re-arms the RX lease, so
-    // periodic uplink (GDS keepalives, paced file chunks) can otherwise defer
-    // a pending downlink forever. Bound the total wait and drop the lease.
-    if (this->m_comResumeNeeded && (this->m_state == READY) &&
-        (this->m_transmitEnabled == TransmitState::ENABLED) && (this->m_rxTxHoldoffTicks > 0)) {
-        if (++this->m_txStarvedTicks >= this->m_rxHoldoffStarvationTicks) {
             this->m_txStarvedTicks = 0;
-            this->m_rxTxHoldoffTicks = 0;
         }
-    } else {
-        this->m_txStarvedTicks = 0;
-    }
-    // Resume ComQueue after holdoff/TX FAILURE once the radio can accept TX.
-    resume = this->maybeResumeComStatus();
-    // Copy a completed RX packet out under the lock; allocation and delivery
-    // to downstream components happen after the lock is released.
-    if (this->m_rxDeliverSize > 0) {
-        rxPacketSize = this->m_rxDeliverSize;
-        this->m_rxDeliverSize = 0;
-        (void)::memcpy(rxPacket, this->m_rxPayload, rxPacketSize);
-    }
+        // Resume ComQueue after holdoff/TX FAILURE once the radio can accept TX.
+        resume = this->maybeResumeComStatus();
+        // Copy a completed RX packet out under the lock; allocation and delivery
+        // to downstream components happen after the lock is released.
+        if (this->m_rxDeliverSize > 0) {
+            rxPacketSize = this->m_rxDeliverSize;
+            this->m_rxDeliverSize = 0;
+            (void)::memcpy(rxPacket, this->m_rxPayload, rxPacketSize);
+        }
     }
     this->flushPendingOutputs();
     if (dropPending) {
@@ -286,8 +285,10 @@ void Rfm9XManager ::run_handler(FwIndexType portNum, U32 context) {
     }
 }
 
-void Rfm9XManager ::spiWriteReadComplete_handler(FwIndexType portNum, Fw::Buffer& writeBuffer,
-                                                  Fw::Buffer& readBuffer, const Drv::SpiStatus& status) {
+void Rfm9XManager ::spiWriteReadComplete_handler(FwIndexType portNum,
+                                                 Fw::Buffer& writeBuffer,
+                                                 Fw::Buffer& readBuffer,
+                                                 const Drv::SpiStatus& status) {
     (void)writeBuffer;
     (void)readBuffer;
     TxProgress txProgress = TX_IN_PROGRESS;
@@ -300,56 +301,56 @@ void Rfm9XManager ::spiWriteReadComplete_handler(FwIndexType portNum, Fw::Buffer
     U8 rxPacket[MAX_PACKET_PAYLOAD];
     FwSizeType rxPacketSize = 0;
     {
-    Os::ScopeLock lock(this->m_lock);
-    // A RESET (or any other event that calls beginResetSequence()) may have
-    // discarded the sequence that issued this request before the driver's
-    // completion arrived; the request was still answered (every request
-    // is), but there is nothing to resume.
-    const SpiOpOrigin origin = this->m_spiOpOrigin;
-    this->m_spiOpOrigin = SPI_OP_NONE;
-    if (origin != SPI_OP_NONE) {
-        switch (origin) {
-            case SPI_OP_INIT:
-                this->continueInitializeRadio(status);
-                break;
-            case SPI_OP_TX:
-                txProgress = this->continueAdvanceTransmit(status);
-                if (txProgress != TX_IN_PROGRESS) {
-                    txCompleted = true;
-                    completedBuffer = this->m_txBuffer;
-                    completedContext = this->m_txContext;
-                    this->m_txBuffer = Fw::Buffer();
-                    this->m_txState = TX_IDLE;
-                    this->m_txActive = false;
-                    if (txProgress == TX_SUCCEEDED) {
-                        // Do not immediately re-enter dataIn through the synchronous
-                        // Com SUCCESS callback. Give the peer time to switch to RX
-                        // and reacquire the preamble. RF-level pacing applies
-                        // regardless of origin: it protects physical radio turnaround,
-                        // not the Com protocol.
-                        this->m_txTxHoldoffTicks = this->m_txTxHoldoffBoundTicks;
+        Os::ScopeLock lock(this->m_lock);
+        // A RESET (or any other event that calls beginResetSequence()) may have
+        // discarded the sequence that issued this request before the driver's
+        // completion arrived. If no new request has started, there is
+        // nothing to resume.
+        const SpiOpOrigin origin = this->m_spiOpOrigin;
+        this->m_spiOpOrigin = SPI_OP_NONE;
+        if (origin != SPI_OP_NONE) {
+            switch (origin) {
+                case SPI_OP_INIT:
+                    this->continueInitializeRadio(status);
+                    break;
+                case SPI_OP_TX:
+                    txProgress = this->continueAdvanceTransmit(status);
+                    if (txProgress != TX_IN_PROGRESS) {
+                        txCompleted = true;
+                        completedBuffer = this->m_txBuffer;
+                        completedContext = this->m_txContext;
+                        this->m_txBuffer = Fw::Buffer();
+                        this->m_txState = TX_IDLE;
+                        this->m_txActive = false;
+                        if (txProgress == TX_SUCCEEDED) {
+                            // Do not immediately re-enter dataIn through the synchronous
+                            // Com SUCCESS callback. Give the peer time to switch to RX
+                            // and reacquire the preamble. RF-level pacing applies
+                            // regardless of origin: it protects physical radio turnaround,
+                            // not the Com protocol.
+                            this->m_txTxHoldoffTicks = this->m_txTxHoldoffBoundTicks;
+                        }
+                        this->m_comResumeNeeded = (txProgress != TX_SUCCEEDED);
                     }
-                    this->m_comResumeNeeded = (txProgress != TX_SUCCEEDED);
-                }
-                break;
-            case SPI_OP_RX:
-                this->continueReceivePoll(status);
-                break;
-            case SPI_OP_NONE:
-            default:
-                break;
-        }
+                    break;
+                case SPI_OP_RX:
+                    this->continueReceivePoll(status);
+                    break;
+                case SPI_OP_NONE:
+                default:
+                    break;
+            }
 
-        // After holdoff decays, try a held GS uplink before emitting Com SUCCESS.
-        if (!dropPending && !this->m_txActive && (this->m_state == READY)) {
-            dropPending = this->tryStartPendingTransmit(dropBuffer, dropContext);
+            // Start a held packet when the local pacing permits it.
+            if (!dropPending && !this->m_txActive && (this->m_state == READY)) {
+                dropPending = this->tryStartPendingTransmit(dropBuffer, dropContext);
+            }
+            if (this->m_rxDeliverSize > 0) {
+                rxPacketSize = this->m_rxDeliverSize;
+                this->m_rxDeliverSize = 0;
+                (void)::memcpy(rxPacket, this->m_rxPayload, rxPacketSize);
+            }
         }
-        if (this->m_rxDeliverSize > 0) {
-            rxPacketSize = this->m_rxDeliverSize;
-            this->m_rxDeliverSize = 0;
-            (void)::memcpy(rxPacket, this->m_rxPayload, rxPacketSize);
-        }
-    }
     }
     this->flushPendingOutputs();
     if (rxPacketSize > 0) {
@@ -464,7 +465,7 @@ void Rfm9XManager ::continueInitializeRadio(const Drv::SpiStatus& status) {
         return;
     }
 
-    // enterLoRaMode()'s three writes (datasheet section 6.4, RegOpMode note):
+    // LoRa-mode entry requires three writes (datasheet section 6.4):
     // SLEEP -> LongRangeMode|SLEEP -> LongRangeMode|STANDBY.
     if (this->m_configureStep == 0) {
         this->issueWriteRegister(Reg::OP_MODE, Mode::SLEEP, SPI_OP_INIT);
@@ -482,7 +483,7 @@ void Rfm9XManager ::continueInitializeRadio(const Drv::SpiStatus& status) {
         return;
     }
     if (this->m_configureStep == 3) {
-        // enterLoRaMode() just completed. Build the modem-profile table from
+        // LoRa-mode entry just completed. Build the modem-profile table from
         // current FPP parameters now, once, before walking it.
         Fw::ParamValid isValid = Fw::ParamValid::INVALID;
         const SpreadingFactor sfParam = this->paramGet_SPREADING_FACTOR(isValid);
@@ -651,8 +652,7 @@ bool Rfm9XManager ::startTransmit(Fw::Buffer& data, const ComCfg::FrameContext& 
 }
 
 bool Rfm9XManager ::usesLocalTxHold() const {
-    // Flight wires comStatusOut into ComQueue/ComRetry. The Feather GS does not,
-    // so a busy-radio reject would otherwise permanently drop uplink frames.
+    // Without a status connection there is no upstream Com retry signal.
     return !this->isConnected_comStatusOut_OutputPort(0);
 }
 
@@ -675,9 +675,8 @@ bool Rfm9XManager ::tryStartPendingTransmit(Fw::Buffer& dropBuffer, ComCfg::Fram
     if (this->m_transmitEnabled != TransmitState::ENABLED) {
         return false;
     }
-    // Pace pending GS uplinks with the post-TX quiet window. RX holdoff is
-    // ignored here so continuous TM cannot pin the pending queue. TX holdoff
-    // is required so a UART burst cannot drain back-to-back.
+    // Pace locally held packets with post-TX quiet time. Ignore RX holdoff
+    // here so continuous incoming traffic cannot pin the pending queue.
     if ((this->m_state != READY) || this->channelBusy() || (this->m_txTxHoldoffTicks > 0)) {
         return false;
     }
@@ -732,8 +731,8 @@ void Rfm9XManager ::RESET_cmdHandler(FwOpcodeType opCode, U32 cmdSeq) {
         // Fail an in-flight TX immediately: the radio is about to be held in
         // hardware reset, so further TX SPI traffic is pointless. Any SPI
         // request already issued for it may still complete later, but
-        // beginResetSequence() clears m_spiOpOrigin so that completion is
-        // dropped as stale (see spiWriteReadComplete_handler()).
+        // beginResetSequence() clears m_spiOpOrigin; a completion arriving
+        // before any new request is ignored by the callback.
         abortPending = this->m_txActive;
         if (abortPending) {
             abortBuffer = this->m_txBuffer;
@@ -757,9 +756,7 @@ void Rfm9XManager ::RESET_cmdHandler(FwOpcodeType opCode, U32 cmdSeq) {
 }
 
 // ----------------------------------------------------------------------
-// Receive sequence: one SPI op per step, replacing the old synchronous
-// pollReceive()/tryDeliverReceivedPacket() (which issued up to 8 sequential
-// SPI transactions in a single call).
+// Receive sequence: one SPI operation per step.
 // ----------------------------------------------------------------------
 
 void Rfm9XManager ::pollReceive() {
@@ -873,7 +870,7 @@ void Rfm9XManager ::continueReceivePoll(const Drv::SpiStatus& status) {
                 this->m_packetsReceived++;
                 this->m_pendingOutputs.packetsReceivedChanged = true;
                 this->m_pendingOutputs.packetsReceived = this->m_packetsReceived;
-                // Keep the half-duplex channel clear for the next ground chunk.
+                // Give the peer time to send another packet.
                 this->m_rxTxHoldoffTicks = this->m_rxTxHoldoffBoundTicks;
             }
             this->m_rxState = RX_IDLE;

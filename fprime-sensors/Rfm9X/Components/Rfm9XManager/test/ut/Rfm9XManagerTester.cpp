@@ -473,7 +473,7 @@ void Rfm9XManagerTester ::test_receive_large() {
 
 void Rfm9XManagerTester ::test_default_register_image() {
     this->makeReady();
-    // This is the canonical default enum image mirrored by the ground station:
+    // This is the library's default enum image:
     // SF7 / BW_125_KHZ / CR_4_5 / 434 MHz / DBM_13.
     ASSERT_EQ(this->m_model.readRegisterValue(Reg::FRF_MSB), 0x6C);
     ASSERT_EQ(this->m_model.readRegisterValue(Reg::FRF_MID), 0x80);

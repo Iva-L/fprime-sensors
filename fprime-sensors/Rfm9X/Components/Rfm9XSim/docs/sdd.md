@@ -1,49 +1,65 @@
 # Rfm9X::Rfm9XSim
 
-The `Rfm9XSim` is a register-level simulation of the RFM9XHCW radio presented
-as the far side of the F Prime `Drv.Spi` interface. It allows a deployment (or
-unit test) to run the `Rfm9XManager` against a simulated radio with no
-hardware: the manager's SPI transactions operate on a simulated register file
-and 66-byte FIFO, and the simulated "RF air interface" is tunneled over a
-`Drv.ByteStreamDriver` (e.g. `Drv.TcpServer`) so the GDS can communicate with
-the deployment end-to-end.
+`Rfm9XSim` is a passive test component that attaches the
+`Rfm9XManager` asynchronous SPI request/completion interface to
+`Rfm9XSimModel`, a plain C++ model of the LoRa register subset used by the
+manager. The model is also used directly by the manager's unit tests.
+This is a test article, not flight software or a complete radio simulator.
 
-The register model itself is a plain C++ class (`Rfm9XSimModel`) with no
-F Prime dependencies beyond basic types, so it is also linked directly into
-the `Rfm9XManager` unit tests.
+## Interfaces and scheduling
 
-## Requirements
+| Port | Purpose |
+| --- | --- |
+| `spiWriteReadAsync` | Execute one simulated SPI request |
+| `spiWriteReadAsyncComplete` | Return the request buffers and status |
+| `run` | Deliver one pending SPI completion |
+| `airDataIn` / `airDataReturnOut` | Inject received bytes and return the input buffer |
+| `airDataOut` | Send a simulated transmitted payload to a byte-stream peer |
+| `allocate` / `deallocate` | Supply temporary buffers for the transmitted payload |
+| `airReady` | Driver-ready notification, currently ignored |
 
-| ID | Shall Statement | Description / Context | Test Method |
-|---|---|---|---|
-| REQ-RFM9XSIM-001 | The simulation shall implement the `Drv.Spi` interface, emulating single, burst, and FIFO SPI register access per datasheet §5.2.1 (wnr address bit, address auto-increment, FIFO address 0x00 non-incrementing). | Full-duplex transaction semantics: MISO byte i is produced while MOSI byte i is consumed. | Unit test |
-| REQ-RFM9XSIM-002 | The simulation shall model the RFM9X register file with datasheet reset values, including `RegVersion` (0x10) = 0x24. | Enables the manager's detection logic to function unmodified. | Unit test |
-| REQ-RFM9XSIM-003 | The simulation shall model the 66-byte FIFO and the `RegIrqFlags1`/`RegIrqFlags2` flags `ModeReady`, `SyncAddressMatch`, `Rssi`, `FifoNotEmpty`, `FifoLevel`, `FifoFull`, `PacketSent`, and `PayloadReady`. | Flag set used by packet-mode drivers, including FIFO streaming and listen-before-talk. | Unit test |
-| REQ-RFM9XSIM-004 | While in transmit mode, the simulation shall drain the variable-length packet from the FIFO at the byte-clock rate, "transmit" the packet payload out its air interface when the declared length has been clocked out, and set `PacketSent`. | Pacing exercises the manager's FIFO top-up path for packets larger than the FIFO. | Unit test |
-| REQ-RFM9XSIM-005 | While in receive mode, the simulation shall packetize bytes received on its air interface into variable-length packets of at most 255 payload bytes and stream them into the FIFO at the byte-clock rate, setting `SyncAddressMatch` during delivery and `PayloadReady` when the packet is fully delivered. | Pacing exercises the manager's in-reception FIFO drain path for packets larger than the FIFO. | Unit test |
-| REQ-RFM9XSIM-006 | The simulation shall bound buffered air-interface data, dropping the oldest data when the bound is exceeded. | Radios drop packets; the sim must not grow memory without bound. | Unit test |
+An SPI transaction is evaluated when requested; its completion is deferred
+until `run`. Only one completion can be pending. Connect both the manager and
+the simulator to a scheduler, and ensure the manager has at most one SPI
+request outstanding. `SimSubtopology` connects the SPI pair but does not
+provide scheduler, air-interface, or buffer-manager connections.
 
-## Interface Summary
+The SPI input is guarded, but `run` and `airDataIn` are synchronous and do
+not share that guard. The deployment must serialize these handlers and the
+model's users; this component does not provide general concurrent access
+protection.
 
-| Direction | Data | Peer |
-|---|---|---|
-| Input | SPI transactions (`SpiWriteRead`, guarded) | `Rfm9XManager.spiWriteRead` |
-| Input | Uplink bytes from the GDS "air" tunnel (`airDataIn`, `Drv.ByteStreamData`) | `Drv.TcpServer.$recv` |
-| Output | Return of air receive buffers (`airDataReturnOut`) | `Drv.TcpServer.recvReturnIn` |
-| Output | Transmitted packet payloads to the "air" tunnel (`airDataOut`, `Drv.ByteStreamSend`) | `Drv.TcpServer.$send` |
-| Output | Buffer allocation/deallocation (`allocate`/`deallocate`) | `Svc.BufferManager` |
+## Model behavior and limits
 
-## Design Notes
+- The model implements the SPI address/write flag, register bursts, a
+  256-byte FIFO with an incrementing FIFO pointer, and the LoRa register
+  subset needed for configuration, packet TX/RX, IRQ clearing, and status.
+  `RegVersion` at `0x42` reads `0x12`. Reset initializes modeled register
+  values, including an intentional LoRa standby starting mode; it is not a
+  complete power-on emulation.
+- SPI byte exchanges advance a synthetic clock. One air-byte step occurs per
+  two SPI byte clocks, subject to configurable mode-settle delays. TX takes
+  a number of air steps proportional to payload size, asserts `TxDone`, and
+  queues the payload. RX similarly advances a staged packet and sets
+  `RxDone`, optionally with `PayloadCrcError`. These timings are not LoRa
+  time-on-air calculations and stop advancing when SPI activity stops.
+- The model buffers at most 2048 incoming bytes, discarding the oldest bytes
+  on overflow. It packetizes buffered bytes into chunks up to
+  `MAX_PAYLOAD_LENGTH`; a byte stream does **not** preserve original sender
+  packet boundaries. Up to eight transmitted packets await retrieval; new
+  transmitted packets are not queued if that queue is full.
+- `Rfm9XSim` sends each retrieved TX payload through `airDataOut` using a
+  temporary allocated buffer, which it deallocates after the synchronous
+  call. A missing output drops the packet; an undersized allocation emits
+  `SimAllocationFailed`. A connected byte-stream peer must consume the
+  buffer during the call.
+- Test controls can simulate an absent radio, busy channel, stalled TxDone,
+  mode-settle delays, corrupt frames, and RSSI/SNR readbacks. No modulation,
+  propagation, realistic RF timing, collisions, or actual CRC calculation is
+  modeled. The simulator cannot prove hardware behavior or OTA GDS framing.
 
-- **Component kind**: `passive`. The SPI port is `guarded` (per `Drv.Spi`) and
-  the air input is synchronous; the guard serializes access to the model.
-- **Byte clock**: Time is modeled by advancing the air interface one byte
-  time per SPI byte exchanged. Transmissions drain the FIFO and receptions
-  fill it at that rate, so packets larger than the 66-byte FIFO stream
-  through it as the manager polls, and `SyncAddressMatch` is observable while
-  a reception is in progress (exercising listen-before-talk).
-- **Fidelity**: The model covers the packet-mode subset exercised by
-  `Rfm9XManager` (register access modes, FIFO, mode transitions, IRQ flags).
-  Modulation, exact bit-rate timing, RSSI dynamics, AES, and address
-  filtering are not modeled; `RegRssiValue` reads back a fixed nominal value.
-- **This is a test article, not flight software.**
+## Verification
+
+The standalone model tests cover register access, FIFO behavior, packet
+transmission/reception, and fault controls. Manager tests exercise the model
+through the manager's SPI request/completion contract.

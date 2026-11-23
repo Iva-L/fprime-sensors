@@ -7,10 +7,8 @@ module Rfm9X {
 
         @ Asynchronous SPI request: the model runs the transaction immediately
         @ (it is plain simulated register logic, no real timing), but the
-        @ completion is delivered later from run() rather than inline --
-        @ delivering it synchronously here would re-enter Rfm9XManager's own
-        @ (non-recursive) lock from the same call stack that is already
-        @ holding it while issuing the request.
+        @ completion is delivered later from run() rather than inline. The
+        @ deployment must serialize request, completion, and air handlers.
         guarded input port spiWriteReadAsync: [Drv.AsyncSpiCfg.SpiDriverPorts] Drv.SpiWriteReadRequest
 
         ###### Port below must be connected: every request is completed through it ######
